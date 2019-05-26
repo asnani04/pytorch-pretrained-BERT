@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
 
-    def __init__(self, guid, text_a, text_b=None, label=None):
+    def __init__(self, guid, text_a, text_b=None, label=None, first_prob=None, first_label=None):
         """Constructs a InputExample.
 
         Args:
@@ -57,21 +57,28 @@ class InputExample(object):
             Only must be specified for sequence pair tasks.
             label: (Optional) string. The label of the example. This should be
             specified for train and dev examples, but not for test examples.
+            first_prob: probability of text being a positive example for first addition
+            (sarcasm)
+            first_label: label of text being positive example for first addition (sarcasm)
         """
         self.guid = guid
         self.text_a = text_a
         self.text_b = text_b
         self.label = label
+        self.first_prob = float(first_prob)
+        self.first_label = int(first_label)
 
 
 class InputFeatures(object):
     """A single set of features of data."""
 
-    def __init__(self, input_ids, input_mask, segment_ids, label_id):
+    def __init__(self, input_ids, input_mask, segment_ids, label_id, first_prob, first_label):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
         self.label_id = label_id
+        self.first_prob = first_prob
+        self.first_label = first_label
 
 
 class DataProcessor(object):
@@ -263,8 +270,10 @@ class YelpProcessor(DataProcessor):
             guid = "%s-%s" % (set_type, i)
             text_a = line[0]
             label = line[1]
+            first_prob = line[2]
+            first_label = line[3]
             examples.append(
-                InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+                InputExample(guid=guid, text_a=text_a, text_b=None, label=label, first_prob=first_prob, first_label=first_label))
         return examples
 
 
@@ -515,12 +524,15 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
             logger.info(
                     "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
             logger.info("label: %s (id = %d)" % (example.label, label_id))
-
+            logger.info("first prob: %s" % (str(example.first_prob)))
+            
         features.append(
                 InputFeatures(input_ids=input_ids,
                               input_mask=input_mask,
                               segment_ids=segment_ids,
-                              label_id=label_id))
+                              label_id=label_id,
+                              first_prob=example.first_prob,
+                              first_label=example.first_label))
     return features
 
 
@@ -847,7 +859,11 @@ def main():
         elif output_mode == "regression":
             all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.float)
 
-        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
+        all_first_probs = torch.tensor([f.first_prob for f in train_features], dtype=torch.long)
+        all_first_labels = torch.tensor([f.first_label for f in train_features], dtype=torch.long)
+        
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
+                                   all_label_ids, all_first_probs, all_first_labels)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -860,10 +876,10 @@ def main():
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
+                input_ids, input_mask, segment_ids, label_ids, first_probs, first_labels = batch
 
                 # define a new function to compute loss values for both output_modes
-                logits = model(input_ids, segment_ids, input_mask, labels=None)
+                logits = model(input_ids, segment_ids, input_mask, labels=None, first_probs, first_labels)
 
                 if output_mode == "classification":
                     loss_fct = CrossEntropyLoss()
@@ -931,6 +947,9 @@ def main():
         elif output_mode == "regression":
             all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.float)
 
+        all_first_probs = torch.tensor([f.first_probs for f in eval_features], dtype=torch.long)
+        all_first_labels = torch.tensor([f.first_labels for f in eval_features], dtype=torch.long)
+        
         eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
@@ -941,14 +960,16 @@ def main():
         nb_eval_steps = 0
         preds = []
 
-        for input_ids, input_mask, segment_ids, label_ids in tqdm(eval_dataloader, desc="Evaluating"):
+        for input_ids, input_mask, segment_ids, label_ids, first_probs, first_labels in tqdm(eval_dataloader, desc="Evaluating"):
             input_ids = input_ids.to(device)
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
             label_ids = label_ids.to(device)
+            first_probs = first_probs.to(device)
+            first_labels = first_labels.to(device)
 
             with torch.no_grad():
-                logits = model(input_ids, segment_ids, input_mask, labels=None)
+                logits = model(input_ids, segment_ids, input_mask, labels=None, first_probs, first_labels)
 
             # create eval loss and other metric required by the task
             if output_mode == "classification":
